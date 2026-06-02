@@ -109,7 +109,7 @@ data = {
     }
   ],
   'dialect': 'alphafold3',
-  'version': 3
+  'version': 2
 }
 
 with open(json_out, 'w') as f:
