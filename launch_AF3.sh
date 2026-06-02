@@ -6,116 +6,205 @@ OUTPUT_DIR="$PWD/af3_output"
 USE_GPU02=0
 NUM_SEEDS=1
 
+# Arrays holding the (repeatable) molecular entities
+FASTA_FILES=()    # receptor FASTA files  (each may hold several records)
+PEPTIDE_SEQS=()   # peptides: raw sequence strings OR FASTA file paths
+LIGAND_SMILES=()  # ligands given as SMILES
+CCD_CODES=()      # ligands given as CCD codes (e.g. ATP, HEM)
+
 # Help function
 show_help() {
     cat << EOF
-Usage: ./submit_af3.sh -f RECEPTOR.fasta -l SMILES [OPTIONS]
+Usage: ./submit_af3.sh [-f RECEPTOR.fasta] [-p PEPTIDE] [-l SMILES] [-c CCD] [OPTIONS]
 
-A wrapper script to generate the AF3 JSON input and submit a Slurm job 
-for a single-chain protein and ligand complex on the ILF Grid.
+A wrapper script to generate the AF3 JSON input and submit a Slurm job for a
+multi-entity complex (any mix of receptors, peptides and ligands) on the ILF Grid.
 
-Required arguments:
-  -f, --fasta   FILE        Path to the FASTA file containing the receptor sequence.
-  -l, --ligand  SMILES      The SMILES string of the ligand.
+All entity flags are REPEATABLE and can be mixed freely. You must supply at
+least one entity. In AF3 a "receptor" and a "peptide" are both protein chains;
+the two flags exist only for convenience.
+
+Entity arguments (repeatable):
+  -f, --fasta    FILE    Receptor FASTA file. A multi-record FASTA (several '>'
+                         headers) is expanded into one protein chain per record.
+  -p, --peptide  SEQ     Peptide chain. Accepts either a raw amino-acid sequence
+                         string or a path to a FASTA file.
+  -l, --ligand   SMILES  Ligand specified by SMILES string.
+  -c, --ccd      CODE    Ligand specified by CCD code (e.g. ATP, HEM, NAD).
 
 Optional arguments:
-  -n, --name    NAME        Name of the job and output prefix (default: af3_job).
-  -o, --output  DIR         Output directory (default: ./af3_output).
-  -s, --seeds   N           Number of random seeds / predictions (default: 1).
-  -g, --gpu02               Run specifically on gpu02 (uses general DBs and xla flash attention).
-  -h, --help                Show this help message and exit.
+  -n, --name     NAME    Name of the job and output prefix (default: af3_job).
+  -o, --output   DIR     Output directory (default: ./af3_output).
+  -s, --seeds    N       Number of random seeds / predictions (default: 1).
+  -g, --gpu02            Run specifically on gpu02 (general DBs + xla flash attention).
+  -h, --help             Show this help message and exit.
 
-Example:
-  ./submit_af3.sh -f receptor.fasta -l "OC(=O)Cc1cn..." -n "CamKIId_pipa" -s 5
+Chain IDs are assigned automatically and uniquely (A, B, C, ... then AA, AB, ...)
+across every protein and ligand in the order they are listed below: receptors
+first, then peptides, then SMILES ligands, then CCD ligands.
+
+Examples:
+  # Two receptors + one peptide + one ligand, 5 seeds
+  ./submit_af3.sh -f recA.fasta -f recB.fasta -p "GSHMKKLA..." -l "OC(=O)Cc1cn..." -n complex1 -s 5
+
+  # Single multi-record FASTA (becomes several chains) + a cofactor by CCD code
+  ./submit_af3.sh -f heterodimer.fasta -c ATP -n dimer_atp
 EOF
 }
 
 # Parse command-line arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        -f|--fasta) FASTA_FILE="$2"; shift ;;
-        -l|--ligand) LIGAND="$2"; shift ;;
-        -n|--name) JOB_NAME="$2"; shift ;;
-        -o|--output) OUTPUT_DIR="$2"; shift ;;
-        -s|--seeds) NUM_SEEDS="$2"; shift ;;
-        -g|--gpu02) USE_GPU02=1 ;;
-        -h|--help) show_help; exit 0 ;;
+        -f|--fasta)   FASTA_FILES+=("$2");   shift ;;
+        -p|--peptide) PEPTIDE_SEQS+=("$2");  shift ;;
+        -l|--ligand)  LIGAND_SMILES+=("$2"); shift ;;
+        -c|--ccd)     CCD_CODES+=("$2");     shift ;;
+        -n|--name)    JOB_NAME="$2";         shift ;;
+        -o|--output)  OUTPUT_DIR="$2";       shift ;;
+        -s|--seeds)   NUM_SEEDS="$2";        shift ;;
+        -g|--gpu02)   USE_GPU02=1 ;;
+        -h|--help)    show_help; exit 0 ;;
         *) echo "Unknown parameter passed: $1"; show_help; exit 1 ;;
     esac
     shift
 done
 
-# Validate required arguments
-if [ -z "$FASTA_FILE" ] || [ -z "$LIGAND" ]; then
-    echo "Error: Both a FASTA file (-f) and ligand SMILES (-l) must be provided."
+# Validate that at least one entity was provided
+if [ ${#FASTA_FILES[@]} -eq 0 ] && [ ${#PEPTIDE_SEQS[@]} -eq 0 ] \
+   && [ ${#LIGAND_SMILES[@]} -eq 0 ] && [ ${#CCD_CODES[@]} -eq 0 ]; then
+    echo "Error: provide at least one entity: -f (receptor), -p (peptide), -l (ligand SMILES) or -c (ligand CCD)."
     echo "Run './submit_af3.sh --help' for usage instructions."
     exit 1
 fi
 
-# Validate FASTA file exists
-if [ ! -f "$FASTA_FILE" ]; then
-    echo "Error: FASTA file '$FASTA_FILE' not found."
-    exit 1
-fi
+# Validate that every receptor FASTA file exists
+for f in "${FASTA_FILES[@]}"; do
+    if [ ! -f "$f" ]; then
+        echo "Error: FASTA file '$f' not found."
+        exit 1
+    fi
+done
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 OUTPUT_DIR=$(realpath "$OUTPUT_DIR")
 JSON_FILE="${OUTPUT_DIR}/${JOB_NAME}.json"
 
-# Safely parse the FASTA and generate JSON using Python
-python3 -c "
-import json
-import sys
+# Write a small Python generator to a temp file and pass all data as argv.
+# Passing values as argv (instead of interpolating into the Python source)
+# avoids any quoting/escaping problems with SMILES strings.
+PYGEN=$(mktemp "${TMPDIR:-/tmp}/af3_gen_XXXXXX.py")
+trap 'rm -f "$PYGEN"' EXIT
 
-fasta_path = '$FASTA_FILE'
-smiles = r'$LIGAND'
-job_name = '$JOB_NAME'
-json_out = '$JSON_FILE'
-num_seeds = int('$NUM_SEEDS')
+cat << 'PYEOF' > "$PYGEN"
+import json, sys, os, argparse, string
 
-sequence_lines = []
-try:
-    with open(fasta_path, 'r') as f:
-        for line in f:
+
+def chain_ids():
+    """Yield unique IDs: A, B, ..., Z, AA, AB, ... (bijective base-26)."""
+    letters = string.ascii_uppercase
+    i = 0
+    while True:
+        n, s = i, ""
+        while True:
+            s = letters[n % 26] + s
+            n = n // 26 - 1
+            if n < 0:
+                break
+        yield s
+        i += 1
+
+
+def read_fasta(path):
+    """Return a list of sequences (one per '>' record) from a FASTA file."""
+    seqs, cur = [], []
+    with open(path) as fh:
+        for line in fh:
             line = line.strip()
-            if line and not line.startswith('>'):
-                sequence_lines.append(line)
-except Exception as e:
-    print(f'Error reading FASTA file: {e}')
-    sys.exit(1)
+            if not line:
+                continue
+            if line.startswith(">"):
+                if cur:
+                    seqs.append("".join(cur))
+                    cur = []
+            else:
+                cur.append(line)
+    if cur:
+        seqs.append("".join(cur))
+    return seqs
 
-protein_seq = ''.join(sequence_lines)
 
-if not protein_seq:
-    print('Error: No sequence found in the provided FASTA file.')
+p = argparse.ArgumentParser()
+p.add_argument("--name", required=True)
+p.add_argument("--out", required=True)
+p.add_argument("--seeds", type=int, required=True)
+p.add_argument("--fasta", nargs="*", default=[])
+p.add_argument("--peptide", nargs="*", default=[])
+p.add_argument("--smiles", nargs="*", default=[])
+p.add_argument("--ccd", nargs="*", default=[])
+a = p.parse_args()
+
+# Collect all protein chains (receptors first, then peptides)
+protein_seqs = []
+
+for fp in a.fasta:
+    s = read_fasta(fp)
+    if not s:
+        print(f"Error: no sequence found in FASTA file '{fp}'.", file=sys.stderr)
+        sys.exit(1)
+    protein_seqs.extend(s)
+
+for pep in a.peptide:
+    if os.path.isfile(pep):                       # a FASTA path was given
+        s = read_fasta(pep)
+        if not s:
+            print(f"Error: no sequence found in peptide FASTA '{pep}'.", file=sys.stderr)
+            sys.exit(1)
+        protein_seqs.extend(s)
+    else:                                         # a raw sequence string was given
+        protein_seqs.append(pep.strip())
+
+# Build the sequences array with unique chain IDs
+ids = chain_ids()
+sequences = []
+for seq in protein_seqs:
+    sequences.append({"protein": {"id": next(ids), "sequence": seq}})
+for smi in a.smiles:
+    sequences.append({"ligand": {"id": next(ids), "smiles": smi}})
+for code in a.ccd:
+    sequences.append({"ligand": {"id": next(ids), "ccdCodes": [code]}})
+
+if not sequences:
+    print("Error: no entities to write.", file=sys.stderr)
     sys.exit(1)
 
 data = {
-  'name': job_name,
-  'modelSeeds': list(range(1, num_seeds + 1)),
-  'sequences': [
-    {
-      'protein': {
-        'id': 'A',
-        'sequence': protein_seq
-      }
-    },
-    {
-      'ligand': {
-        'id': 'LIG',
-        'smiles': smiles
-      }
-    }
-  ],
-  'dialect': 'alphafold3',
-  'version': 2
+    "name": a.name,
+    "modelSeeds": list(range(1, a.seeds + 1)),
+    "sequences": sequences,
+    "dialect": "alphafold3",
+    "version": 2,
 }
 
-with open(json_out, 'w') as f:
-    json.dump(data, f, indent=2)
-print(f'Seeds used: {list(range(1, num_seeds + 1))}')
-"
+with open(a.out, "w") as fh:
+    json.dump(data, fh, indent=2)
+
+n_prot = len(protein_seqs)
+n_lig = len(a.smiles) + len(a.ccd)
+print(f"Entities: {n_prot} protein chain(s), {n_lig} ligand(s)")
+print(f"Chain IDs: {[list(e.values())[0]['id'] for e in sequences]}")
+print(f"Seeds used: {list(range(1, a.seeds + 1))}")
+PYEOF
+
+# Generate the JSON. Empty arrays expand to nothing, which argparse nargs='*' handles.
+python3 "$PYGEN" \
+    --name "$JOB_NAME" \
+    --out "$JSON_FILE" \
+    --seeds "$NUM_SEEDS" \
+    --fasta "${FASTA_FILES[@]}" \
+    --peptide "${PEPTIDE_SEQS[@]}" \
+    --smiles "${LIGAND_SMILES[@]}" \
+    --ccd "${CCD_CODES[@]}"
 
 if [ $? -ne 0 ]; then
     echo "Failed to generate JSON input."
