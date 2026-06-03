@@ -296,8 +296,8 @@ done
 
 # Partition / resource defaults by accelerator (overridable)
 if [[ "$ACCELERATOR" == "gpu" ]]; then
-  [[ -z "$PARTITION" ]] && PARTITION="priority"
-  [[ -z "$QOS" ]]       && QOS="prio"
+  [[ -z "$PARTITION" ]] && PARTITION="standard"
+  [[ -z "$QOS" ]]       && QOS="normal"
   [[ -z "$CPUS" ]]      && CPUS=4
   [[ -z "$DEVICES" ]]   && DEVICES="$GPUS"
 else
